@@ -1,10 +1,8 @@
-//
-// Created by ByteDance on 2025/5/27.
-//
-//%%writefile transpose.cu
+%%writefile transpose.cu
 
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <chrono>
 
 #define CHECK(call)\
 {\
@@ -84,6 +82,10 @@ int main(int argc, char **argv) {
     // malloc
     float *h_in = (float*)malloc(nx * ny * sizeof(float));
     float *h_out = (float*)malloc(ny * nx * sizeof(float));
+    if (mode >= 3) {
+        CHECK(cudaMallocHost((void **) &h_out, nx * ny * sizeof(float)));
+        CHECK(cudaMallocHost((void **) &h_in, nx * ny * sizeof(float)));
+    }
     float *d_in, *d_out;
     CHECK(cudaMalloc(&d_in, nx * ny * sizeof(float)));
     CHECK(cudaMalloc(&d_out, nx * ny * sizeof(float)));
@@ -96,7 +98,9 @@ int main(int argc, char **argv) {
             c++;
         }
     }
-    CHECK(cudaMemcpy(d_in, h_in, nx * ny * sizeof(float), cudaMemcpyHostToDevice));
+    if (mode < 3) {
+        CHECK(cudaMemcpy(d_in, h_in, nx * ny * sizeof(float), cudaMemcpyHostToDevice));
+    }
 
     dim3 gridDim(blockCnt, blockCnt);
     int block_x = (nx-1)/blockCnt+1;
@@ -138,9 +142,36 @@ int main(int argc, char **argv) {
             }
             break;
         }
+        case 4: {
+            cudaStream_t streams[N_CHUNKS];
+            float *d_sub_out[N_CHUNKS];
+            for (int i = 0; i < N_CHUNKS; ++i) {
+                cudaStreamCreate(&streams[i]);
+                CHECK(cudaMalloc(&d_sub_out[i], nx * ny / N_CHUNKS * sizeof(float)));
+            }
+            int chunk_size = nx * ny / N_CHUNKS;
+            int chunk_bytes = chunk_size * sizeof(float);
+            dim3 subGridDim(blockCnt, blockCnt/N_CHUNKS);
+            int col_size = blockCnt/N_CHUNKS * blockDim.y;
+            for (int i = 0; i < N_CHUNKS; ++i) {
+                cudaMemcpyAsync(d_in + i * chunk_size, h_in + i * chunk_size, chunk_bytes, cudaMemcpyHostToDevice, streams[i]);
+            }
+            for (int i = 0; i < N_CHUNKS; ++i) {
+                transposeShared2<<<subGridDim, blockDim, (block_x + bank_offset) * block_y * sizeof(float), streams[i]>>>(d_in + i * chunk_size,d_sub_out[i], nx, ny / N_CHUNKS, bank_offset);
+            }
+            for (int i = 0; i < N_CHUNKS; ++i) {
+                for (int j = 0; j < blockDim.x * blockCnt; ++j) {
+                    cudaMemcpyAsync(h_out + j * ny + i * col_size, d_sub_out[i] + j * col_size, col_size * sizeof(float), cudaMemcpyDeviceToHost, streams[i]);
+                }
+            }
+            for (int i = 0; i < N_CHUNKS; ++i) {
+                CHECK(cudaStreamSynchronize(streams[i]));
+            }
+            break;
+        }
 
     }
-    if (mode != 3) {
+    if (mode < 3) {
         CHECK(cudaGetLastError());
         CHECK(cudaMemcpy(h_out, d_out, nx * ny * sizeof(float), cudaMemcpyDeviceToHost));
     }
@@ -159,8 +190,13 @@ int main(int argc, char **argv) {
     }
 
     // free
-    free(h_in);
-    free(h_out);
+    if (mode < 3) {
+        free(h_in);
+        free(h_out);
+    } else {
+        cudaFreeHost(h_in);
+        cudaFreeHost(h_out);
+    }
     CHECK(cudaFree(d_in));
     CHECK(cudaFree(d_out));
 }

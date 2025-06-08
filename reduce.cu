@@ -1,7 +1,4 @@
-//
-// Created by ByteDance on 2025/6/3.
-//
-//%%writefile reduce.cu
+%%writefile reduce.cu
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -156,6 +153,102 @@ __global__ void reduceUnrollShlf(float *A, float *out, int N) {
     }
 }
 
+//__global__ void reduceUnrollWarpReduce(float *A, float *out, int N) {
+//    unsigned int offsetStart = blockDim.x * blockIdx.x;
+//    unsigned int offsetEnd = blockDim.x * (blockIdx.x + 3);
+//    unsigned int l_idx = threadIdx.x;
+//    if (offsetEnd + l_idx >= N) return;
+//
+//    float *l_a = A + offsetStart;
+//    {
+//        float a = l_a[l_idx];
+//        float b = l_a[l_idx + blockDim.x];
+//        float c = l_a[l_idx + blockDim.x * 2];
+//        float d = l_a[l_idx + blockDim.x * 3];
+//        l_a[l_idx] = a + b + c + d;
+//        __syncthreads();
+//    }
+//
+//    for (int stride = blockDim.x / 2; stride >= 32; stride/=2) {
+//        if (l_idx < stride) {
+//            l_a[l_idx] += l_a[l_idx + stride];
+//        }
+//        __syncthreads();
+//    }
+//
+//    float t = l_a[l_idx];
+//    if (l_idx < 32) {
+//        t = __reduce_add_sync(0xFFFFFFFF, t);
+//    }
+//
+//    if (l_idx == 0) {
+//        out[blockIdx.x] = t;
+//    }
+//}
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+namespace cg=cooperative_groups;
+
+/// The following example accepts input in *A and outputs a result into *sum
+/// It spreads the data equally within the block
+__device__ void block_reduce(const float * A, int count, cuda::atomic<float, cuda::thread_scope_block>& total_sum) {
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<32>(block);
+    float thread_sum = 0;
+
+    // Stride loop over all values, each thread accumulates its part of the array.
+    for (int i = block.thread_rank(); i < count; i += block.size()) {
+        thread_sum += A[i];
+    }
+
+    // reduce thread sums in the tile, add the result to the atomic by all tiles
+    // cg::plus<float> allows cg::reduce() to know it can use hardware acceleration for addition
+    cg::reduce_update_async(tile, total_sum, thread_sum, cg::plus<float>());
+
+    // synchronize the block, to ensure all async reductions are ready
+    block.sync();
+}
+
+__global__ void reduceUnrollCG(float *A, float *out, int N) {
+    __shared__ cuda::atomic<float, cuda::thread_scope_block> sum;
+    if (threadIdx.x == 0) {
+        sum.store(0.0f, cuda::memory_order_relaxed);
+    }
+    __syncthreads();
+    block_reduce(A + blockIdx.x * 4 * blockDim.x, blockDim.x * 4, sum);
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = sum.load();
+    }
+}
+
+/// The following example accepts input in *A and outputs a result into *sum
+/// It spreads the data equally within the block
+__device__ void block_reduce_sync(const float * A, int count, float *out) {
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<32>(block);
+    float thread_sum = 0;
+
+    // Stride loop over all values, each thread accumulates its part of the array.
+    for (int i = block.thread_rank(); i < count; i += block.size()) {
+        thread_sum += A[i];
+    }
+
+    // reduce thread sums across the tile, add the result to the atomic
+    // cg::plus<float> allows cg::reduce() to know it can use hardware acceleration for addition
+    float tile_sum = cg::reduce(tile, thread_sum, cg::plus<float>());
+
+    if (threadIdx.x == 0) {
+        out[blockIdx.x] = sum.load();
+    }
+    // synchronize the block, to ensure all async reductions are ready
+    block.sync();
+}
+
+__global__ void reduceUnrollCGSync(float *A, float *out, int N) {
+    block_reduce(A + blockIdx.x * 4 * blockDim.x, blockDim.x * 4, out);
+}
+
 __global__ void reduceUnrollSharedAll(float *A, float *out, int N) {
     unsigned int offsetStart = blockDim.x * blockIdx.x;
     unsigned int offsetEnd = blockDim.x * (blockIdx.x + 3);
@@ -239,6 +332,12 @@ int main(int argc,char** argv) {
             break;
         case 4:
             reduceUnrollSharedAll<<<grid, block, block.x * sizeof(float)>>>(d_in, d_sum, N);
+            break;
+        case 5:
+            reduceUnrollCG<<<grid, block, block.x * sizeof(float)>>>(d_in, d_sum, N);
+            break;
+        case 6:
+            reduceUnrollCGSync<<<grid, block, block.x * sizeof(float)>>>(d_in, d_sum, N);
             break;
     }
 
