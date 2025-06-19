@@ -5,7 +5,8 @@ set(CMAKE_CUDA_STANDARD 17)
 
 add_executable(learn_cuda main.cu
         sum.cu
-        transpose.cu)
+        transpose.cu
+        softmax.cu)
 
 set_target_properties(learn_cuda PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
